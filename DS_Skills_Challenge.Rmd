@@ -1,0 +1,412 @@
+---
+title: "Formula 1 Project"
+author: "Neo Kok"
+date: "2023-11-01"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    df_print: paged
+urlcolor: blue
+---
+
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(warn = -1)
+options(message = FALSE)
+library(tidyverse)
+library(car)
+library(glmnet)
+library(caret)
+library(knitr)
+```
+
+# Project Outline {.toc}
+## Data
+The data used for this project include relational datasets with information about Formula 1 circuits, drivers, constructors, and races. It was downloaded from [this Kaggle source](https://www.kaggle.com/datasets/rohanrao/formula-1-world-championship-1950-2020/). Some data goes as far back as to the inaugural race in 1950 and the most recent is as new as 7/30/2023. 
+
+## Goals
+### 1. What effect has changing the point system had?
+### 2. How has competitiveness changed over time?
+  a) Driver standings
+  b) Constructor standings
+  c) Teammates  
+  
+### 3. Predicting race results  
+  a) Simple linear models
+  b) Logistic regression model
+
+## Motivation
+
+I have been a big Formula 1 fan for most of my life and have always wanted to do a project on Formula 1 data. This challenge provided me the opportunity to showcase my skills while working with data that is fun to work with and is meaningful to me. 
+
+
+# Setting Up {.toc}
+
+## Import Libraries
+library(tidyverse)  
+library(car)  
+library(glmnet)  
+library(caret)  
+library(knitr)
+
+## Import Data
+```{r}
+driver_standings <- read.csv("data/driver_standings.csv")
+drivers <- read.csv("data/drivers.csv")
+lap_times <- read.csv("data/lap_times.csv")
+pit_stops <- read.csv("data/pit_stops.csv")
+races <- read.csv("data/races.csv")
+results <- read.csv("data/results.csv")
+```
+
+# 1. What effect has changing the point system had? {.toc}
+### Scaling up all results to the modern system
+```{r, warning = FALSE}
+adjust_points_up = function(positionOrder, rank){
+  rank = as.numeric(rank)
+  points <- c(25, 18, 15, 12, 10, 8, 6, 4, 2, 1) # Points for 1st to 10th position
+  
+  if(positionOrder <= 10 & rank == 1 & !is.na(rank) & !is.na(positionOrder)){
+    points[positionOrder] = points[positionOrder] + 1
+  }
+  if(positionOrder > 10 | is.na(positionOrder)){
+    return(0)
+  }
+  return(points[positionOrder])
+}
+
+results$adjusted_points_up = mapply(adjust_points_up, results$positionOrder, results$rank)
+```
+
+### Scaling down all results to original 1950s point system
+```{r, warning = FALSE}
+adjust_points_down = function(positionOrder, rank){
+  rank = as.numeric(rank)
+  points <- c(8, 6, 4, 3, 2) # Points for 1st to 5th position
+  
+  if(positionOrder <= 5 & rank == 1 & !is.na(rank) & !is.na(positionOrder)){
+    points[positionOrder] = points[positionOrder] + 1
+  }
+  if(positionOrder > 5 | is.na(positionOrder)){
+    return(0)
+  }
+  return(points[positionOrder])
+}
+
+results$adjusted_points_down = mapply(adjust_points_down, results$positionOrder, results$rank)
+
+```
+
+### Re-calculated leaderboards
+```{r}
+# Create podium and join year variables
+results <- results %>% mutate(podium = ifelse(as.numeric(positionOrder) > 3, 0, 1),
+                              win = ifelse(as.numeric(positionOrder) == 1, 1, 0))
+results <- races %>% select(raceId, year) %>% left_join(results)
+head(results, 10) %>% kable()
+
+#Leaderboards with modern scoring
+scores_adjusted_up = results %>% group_by(driverId) %>%
+  summarise(points = sum(adjusted_points_up), podiums = sum(podium), wins = sum(win)) %>%
+  arrange(-points) 
+head(scores_adjusted_up, 10) %>% kable()
+
+#Top 50 with modern scoring
+leaders_adjusted_up = scores_adjusted_up %>% top_n(50, points) %>% 
+  left_join(drivers, by = c("driverId")) %>% select(forename, surname,
+                                                    points, podiums, wins) %>% 
+  arrange(-points) 
+head(leaders_adjusted_up, 10) %>% kable()
+
+#Leaderboards with original scoring
+scores_adjusted_down = results %>% group_by(driverId) %>%
+  summarise(points = sum(adjusted_points_down), podiums = sum(podium),
+            wins = sum(win)) %>%  arrange(-points)
+head(scores_adjusted_down, 10) %>% kable()
+
+#Top 50 with original scoring
+leaders_adjusted_down = scores_adjusted_down %>% top_n(50, points) %>% 
+  left_join(drivers, by = c("driverId")) %>%
+  select(forename, surname, points, podiums, wins) %>% arrange(-points)
+head(leaders_adjusted_down, 10) %>% kable()
+```
+### Difference in leaderboard
+```{r}
+#Included in top 50
+different = 0
+for(i in 1:nrow(leaders_adjusted_down)){
+  if(!(leaders_adjusted_down$surname[i] %in% leaders_adjusted_up$surname)){
+    different = different + 1
+  }
+}
+
+different / nrow(leaders_adjusted_down)
+
+#Exactly the same position
+different = 0
+for(i in 1:nrow(leaders_adjusted_down)){
+  if(!(leaders_adjusted_down$surname[i] == leaders_adjusted_up$surname[i])){
+    different = different + 1
+  }
+}
+
+different / nrow(leaders_adjusted_down)
+```
+10% of the top 50 drivers would not be in the top 50 if the point system stayed the same from 1950 to today. 84% of the top 50 drivers would be in a different position in the leaderboards if the point system stayed the same from 1950 to today.
+
+# 2. How has competitiveness changed over time? {.toc}
+For the rest of this analysis, comparisons will be made using points adjusted to the modern scoring system to keep things consistent and serve to create a fair comparison.
+
+## a) Driver standings
+Comparing difference in final points for the top three drivers in the drivers standings - how competitive the drivers championship is.
+
+```{r, message = FALSE}
+results %>% group_by(driverId, year) %>% summarise(wins = sum(positionOrder == 1),
+                                                   points = sum(adjusted_points_up)) %>%
+  arrange(-year, -points) %>% ungroup() %>% group_by(year) %>%
+  summarise(difference = points[1] - points[3]) %>% 
+  ggplot(aes(x = year, y = difference)) + geom_point() + geom_smooth()+ theme_classic() +
+  labs(title = "Difference in Points Between Third and First Place in
+       Drivers Championship Over the Years",
+       x = "Year", y = "Difference (Points)")
+
+```
+Scatterplot shows a relatively consistent increase in difference in points for the top three, indicating a decrease in competitiveness in the drivers championship over the years. Notable outliers in the 2007 and 2010 seasons. Smoothed LOESS line included with shaded standard errors.
+
+## b) Constructors standings
+Comparing difference in final points for the top three constructors (teams) in the constructors standings - how competitive the constructors championship is.
+```{r, message = FALSE}
+results %>% group_by(constructorId, year) %>%
+  summarise(wins = sum(positionOrder == 1), points = sum(adjusted_points_up)) %>%
+  arrange(-year, -points) %>% ungroup() %>% group_by(year) %>%
+  summarise(difference = points[1] - points[3]) %>% 
+  ggplot(aes(x = year, y = difference)) + geom_point() + geom_smooth()+theme_classic() +
+  labs(title = "Difference in Points Between Third and First Place in
+       Constructors Championship Over the Years",
+       x = "Year", y = "Difference (Points)")
+
+```
+
+Scatterplot shows an initial increase in competitiveness, which has decreased relatively consistently since the 1970s. Smoothed LOESS line included with shaded standard errors.
+
+## c) Teammates
+Comparing average difference in final points between teammates in the drivers standings - how competitive the teammate battle is. Most constructors only have 2 drivers, although some may have more or less depending on mid-season seat changes/single driver teams. 
+```{r, message = FALSE}
+results %>% group_by(driverId, year, constructorId) %>%
+  summarise(wins = sum(positionOrder == 1), points = sum(adjusted_points_up)) %>%
+  arrange(-year, -points) %>% ungroup() %>% 
+  group_by(constructorId, year) %>% summarise(difference = points[1] - points[2]) %>%
+  ungroup()%>% group_by(year) %>% 
+  summarise(average_diff = mean(difference, na.rm = T)) %>% 
+  ggplot(aes(x = year, y = average_diff)) + geom_point() + geom_smooth() +theme_classic() +
+  labs(title = "Average Difference in Points Between Teammates Over the Years",
+       x = "Year", y = "Average Difference (Points)")
+
+```
+Scatterplot shows an general decrease in competitiveness over time, with a period between 1975-1990 where it stayed quite consistent and followed with a shallower decrease. Smoothed LOESS line included with shaded standard errors.
+
+
+# 3. Predicting race results {.toc}
+## a) Simple linear models
+### Data preparation
+Selecting variables of interest and manipulating data to create a table with the variables. Response variables of interest include: winner/not winner, number of points won, finishing position. Predictor variables of interest include: starting qualifying position, number of pit stops in race, average pit stop time in race, drivers championship standings. 
+```{r, warning = FALSE}
+# Creating number of pit stops and average pit stop duration variable
+stops = pit_stops %>% group_by(raceId, driverId) %>%
+  summarise(stops = max(stop), avg_time = mean(as.numeric(duration), na.rm = T)) 
+
+# Selecting race & driver ID keys, qualification position, finishing position,
+# fastest lap ranking, and number of points won (adjusted to modern scoring).
+# Creating "wins" variable where finishing position = 1. 
+# Joined with pit stop data by race and driver ID keys.
+# Joined with driver standings data to select drivers standings before race start
+total = results %>% select(raceId, driverId, grid, positionOrder, adjusted_points_up, rank) %>%
+  filter(rank != "\\N", rank != "0") %>% left_join(stops, by = c("raceId", "driverId")) %>%
+  left_join(driver_standings, by = c("raceId", "driverId")) %>%
+  select(finish = positionOrder, points = adjusted_points_up, quali = grid, stops,
+         stop_time = avg_time, driver_standing = position, fastest_lap = rank) %>%
+  mutate(win = ifelse(finish == 1, 1, 0))
+
+# Removing NA data - primarily all of the data before 1996 when pit stop times
+# were not tracked.
+total = total[complete.cases(total),]
+# Ensuring all variables are numeric
+total = lapply(total, as.numeric)
+total = data.frame(total)
+# Altering "win" variable as a factor - win or no win
+total$win = as.factor(total$win)
+head(total, 10) %>% kable()
+```
+### Creating models
+```{r}
+# Predicting points: 
+# All predictor variables
+lm_full = lm(points ~ quali + stops + stop_time + driver_standing + fastest_lap, data = total)
+summary(lm_full)
+brief(lm_full)
+# Checking for multicollinearity
+vif(lm_full)
+
+# Excluding two least significant - average stop time, number of pit stops 
+lm_part = lm(points ~ quali + driver_standing + fastest_lap, data = total)
+summary(lm_part)
+brief(lm_part)
+# Checking for multicollinearity
+vif(lm_part)
+
+# Only variables known prior to race start
+lm_before = lm(points ~ quali + driver_standing, data = total)
+brief(lm_before)
+# Checking for multicollinearity
+summary(lm_before)
+vif(lm_before)
+```
+Created three separate simple linear models. All have adjusted \(R^2\) between 0.55 and 0.6. Checked variance inflation factors (VIF) to ensure no multicollinearity. All are below 5 which indicates low multicollinearity. 
+
+### Comparing variable importance
+```{r}
+anova(lm_part, lm_full)
+```
+Since the p-value of the ANOVA between the full and reduced models is less than 0.05, we have convincing evidence that the addition of the number of pit stops and average pit stop time variables are important to increasing the model's accuracy.
+
+## b) Logistic regression model
+We will create a logistic regression model to predict the winner of this weekend's (10/29/23) F1 race. The regression model will only include the qualification position and driver standings as predictors since those are the only ones that we know before the race start. 
+
+### Creating and evaluating the model using train/test sets
+```{r}
+set.seed(1)
+
+#Creating test/training set
+sample <- sample(c(TRUE, FALSE), nrow(total), replace=TRUE, prob=c(0.7,0.3))
+train  <- total[sample, ]
+test   <- total[!sample, ]
+
+#Creating logistic regression model
+LR_before <- glm(win ~ quali + driver_standing, data = train, family = binomial)
+summary(LR_before)
+
+#Predicting win/no win
+train_predictions <- predict(LR_before, newdata = train, type = "response")
+test_predictions <- predict(LR_before, newdata = test, type = "response")
+
+#Evaluating accuracy
+train_accuracy <- sum(ifelse(train_predictions > 0.5, 1, 0) == train$win) / nrow(train)
+test_accuracy <- sum(ifelse(test_predictions > 0.5, 1, 0) == test$win) / nrow(test)
+cat("In-sample accuracy:", train_accuracy)
+cat(" Out-of-sample accuracy:", test_accuracy)
+
+#Confusion matrix of out-of-sample accuracy of the model
+test_confusion <- confusionMatrix(as.factor(ifelse(test_predictions > 0.5, 1, 0)), as.factor(test$win))
+test_confusion
+```
+The model has an accuracy of 96.5% at predicting whether or not a driver will win an F1 race. This seems exceptionally high although when looking at the confusion matrix, is quite misleading. Since there are far more "non-winners" than winners, it is a lot easier for the model to correctly predict "non-winner" and be correct. When looking at the specificity of 54%, it is evident that the model is not incredibly accurate at predicting the winner, although still performs relatively well. 
+
+### Predicting this weekend's race
+Using grid starting position, driver championship standings, and logistic regression model prediction for this weekend's F1 race to predict who will win and what place drivers will end up in. 
+```{r}
+set.seed(1)
+#Driver names, grid starting position, driver championship standings, and model
+#prediction for this weekend
+real_data = data.frame(driver_name = c("Verstappen", "Perez", "Hamilton", "Sainz", "Leclerc", "Alonso", "Russel",  "Piastri", "Norris", "Gasly", "Bottas", "Ocon", "Albon", "Stroll", "Hulkenberg", "Zhou", "Ricciardo", "Tsunoda", "Magnussen", "Sargeant"
+                                          
+                                       
+                                        
+                                          ),
+                       quali = c(3, 5, 6, 2, 1, 14, 8, 7, 17, 11, 9, 15, 13, 20, 12, 10, 4, 18, 16, 19), 
+                       driver_standing = c(1, 2, 3, 5, 7, 4, 8, 9, 6, 10, 14, 12, 13, 11, 15, 17, 22, 16, 18, 20))
+real_data$predicted = predict(LR_before, newdata = real_data, type = "response")
+
+# Sports betting odds rankings
+# Scaled up the probability so that it equals 1
+predicted_finish = real_data %>%
+  mutate(odds = c(1, 3, 2, 6, 8, 9, 5, 7, 4, 11, 17, 10, 13, 14, 18, 16, 15, 12, 19, 20)) %>%
+  arrange(-predicted) %>% mutate(predicted = predicted/sum(predicted), predicted_finish = rank(-predicted))
+predicted_finish %>% rename(expert = odds) %>% kable()
+```
+The predicted winner is Max Verstappen with a 59% chance of winning.
+
+### Comparing to the true results
+We will use the probability of winning a race using the model to rank their predicted positions. We will compare this to the sports betting probabilities prior to the start of the race to see how this simple model compares to expert's predictions.
+```{r}
+# True results
+predicted_finish$true = c(1, NA, 2, 4, 3, NA, 6, 8, 5, 11, 14, 10, 9, NA, 13, 15, 7, 12, NA, NA) 
+kable(predicted_finish %>% select(-predicted, -quali, -driver_standing) %>% rename(expert = odds) %>% arrange((is.na(true)), (true)))
+
+# How many the model predicted the position correctly & how many the sports 
+# bets odds predicted correctly
+correct_prediction = 0
+correct_odds = 0
+for(i in 1:20){
+  if(!is.na(predicted_finish$true[i]) & predicted_finish$true[i]==i){
+    correct_prediction = correct_prediction + 1
+  }
+  if(!is.na(predicted_finish$true[i]) & predicted_finish$true[i]==predicted_finish$odds[i]){
+    correct_odds = correct_odds + 1
+  }
+}
+
+cat("Model % correct predictions:", correct_prediction/20)
+cat("Sports bets % correct predictions:", correct_odds/20)
+
+# Absolute difference in model's position error and difference in sports bets 
+# position error
+total_diff = 0
+odds_diff = 0
+for(i in 1:nrow(predicted_finish)){
+  if(!is.na(predicted_finish$true[i])){
+  total_diff = total_diff + abs(predicted_finish$true[i] - i)
+  odds_diff = odds_diff + abs(predicted_finish$true[i] - predicted_finish$odds[i])
+  }
+}
+
+cat("Model average absolute difference:", total_diff/20)
+cat("Sports bets average absolute difference:", odds_diff/20)
+
+
+#Ignoring drivers that DNFed 
+predicted_finish = predicted_finish[complete.cases(predicted_finish),]
+#Updating odds by ignoring drivers that DNFed
+predicted_finish = predicted_finish %>% 
+  mutate(odds = case_when((odds > 3 & odds < 9) ~ (odds - 1),
+                          (odds > 9 & odds < 11) ~  (odds - 2),
+                          (odds > 11 & odds < 14) ~ (odds - 3),
+                          TRUE ~ odds))
+
+
+# How many the model predicted the position correctly & how many the sports bets odds
+# predicted correctly when removing DNF drivers
+correct_prediction = 0
+correct_odds = 0
+for(i in 1:nrow(predicted_finish)){
+  if(!is.na(predicted_finish$true[i]) & predicted_finish$true[i]==i){
+    correct_prediction = correct_prediction + 1
+  }
+  if(!is.na(predicted_finish$true[i]) & predicted_finish$true[i]==predicted_finish$odds[i]){
+    correct_odds = correct_odds + 1
+  }
+}
+
+cat("Model % correct predictions ignoring DNFs:", correct_prediction/15)
+cat("Sports bets % correct predictions ignoring DNFs:", correct_odds/15)
+
+
+# Absolute difference in model's position error and difference in sports bets position
+# error when removing DNF drivers
+total_diff = 0
+odds_diff = 0
+for(i in 1:nrow(predicted_finish)){
+  total_diff = total_diff + abs(predicted_finish$true[i] - i)
+  odds_diff = odds_diff + abs(predicted_finish$true[i] - predicted_finish$odds[i])
+}
+
+cat("Model average absolute difference ignoring DNFs:", total_diff/15)
+cat("Sports bets average absolute difference ignoring DNFs:", odds_diff/15)
+```
+Overall, the model performed quite well when compared to the experts. Both predicted Max Verstappen to win, which he did. If we exclude all of the DNFs, which are frequently due to misfortune and not race pace, both the model and sports bets exactly predicted 3 positions correctly. The model was off by two positions, on average, which was slightly better than the sports betting odds at 2.23 positions on average. If Sergio Perez (predicted as 2nd) did not DNF on the first corner and ended up finishing close to the front like his teammate, the model would have been even more accurate compared to the sports betting odds. Overall, this is quite impressive considering the model only takes 2 predictors. Future models could be tested using other predictors.
+
+
+
+
