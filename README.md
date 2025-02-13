@@ -1,1 +1,1 @@
-This repository contains the code and an accompanying slide deck for a multitude of analysis on Formula 1 data. At the end, I create a simple logistic regression prediction model of race finishing positions that performs equally well to professional models on a real-life example.
+This repository contains the code and an accompanying slide deck for a multitude of analyses on Formula 1 data. At the end, I create a simple logistic regression prediction model of race finishing positions that performs equally well to professional models on a real-life example.
